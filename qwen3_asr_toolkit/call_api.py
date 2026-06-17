@@ -1,46 +1,59 @@
-import argparse
 import os
-import srt
-import requests
-import dashscope
-import concurrent.futures
+import argparse
 
-from tqdm import tqdm
-from datetime import timedelta
-from collections import Counter
+import requests
+
 from urllib.parse import urlparse
-from silero_vad import load_silero_vad
+
 from qwen3_asr_toolkit.qwen3asr import QwenASR
-from qwen3_asr_toolkit.audio_tools import load_audio, process_vad, save_audio_file, WAV_SAMPLE_RATE
+from qwen3_asr_toolkit.audio_tools import load_audio, build_srt, WAV_SAMPLE_RATE
+
+
+DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+DEFAULT_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Python toolkit for the Qwen3-ASR API—parallel high‑throughput calls, robust long‑audio transcription, multi‑sample‑rate support."
+        description="Fully offline local-GPU toolkit for Qwen3-ASR: long-audio transcription with optional SRT timestamps."
     )
-    parser.add_argument("--input-file", '-i', type=str, required=True, help="Input media file path")
-    parser.add_argument("--context", '-c', type=str, default="", help="Any text context content for Qwen3-ASR-Flash")
-    parser.add_argument("--dashscope-api-key", '-key', type=str, help="DashScope API key")
-    parser.add_argument("--num-threads", '-j', type=int, default=4, help="Number of threads to use for parallel calls")
-    parser.add_argument("--vad-segment-threshold", '-d', type=int, default=120, help="Segment threshold seconds for VAD")
-    parser.add_argument("--tmp-dir", '-t', type=str, default=os.path.join(os.path.expanduser("~"), "qwen3-asr-cache"), help="Temp directory path")
-    parser.add_argument("--save-srt", '-srt', action="store_true", help="Save SRT subtitle file")
-    parser.add_argument("--silence", '-s', action="store_true", help="Reduce the output info on the terminal")
+    parser.add_argument("--input-file", "-i", type=str, required=True, help="Input media file path or http(s) URL")
+    parser.add_argument("--context", "-c", type=str, default="", help="Optional text context to bias recognition")
+    parser.add_argument("--language", "-l", type=str, default=None, help="Force a language (e.g. Korean, English). Default: auto-detect")
+    parser.add_argument("--model", "-m", type=str, default=DEFAULT_ASR_MODEL, help="ASR model repo id or local path")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Torch device, e.g. cuda:0 or cpu")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Inference dtype")
+    parser.add_argument("--max-batch-size", type=int, default=1, help="Max internal inference batch size. Raise only when transcribing many short files; keep at 1 for long audio to avoid OOM")
+    parser.add_argument("--chunk-sec", type=int, default=None, help="Internal ASR chunk length in seconds. Default: auto-sized to fit free VRAM (no OOM, no truncation)")
+    parser.add_argument("--max-new-tokens", type=int, default=4096, help="Max tokens generated per audio chunk")
+    parser.add_argument("--attn", type=str, default=None, help="attn_implementation, e.g. flash_attention_2 or sdpa")
+    parser.add_argument("--save-srt", "-srt", action="store_true", help="Also write a timestamped .srt subtitle file")
+    parser.add_argument("--aligner", type=str, default=DEFAULT_ALIGNER_MODEL, help="Forced-aligner model (only loaded with --save-srt)")
+    parser.add_argument("--output", "-o", type=str, default=None, help="Output path base (without extension). Default: alongside input")
+    parser.add_argument("--silence", "-s", action="store_true", help="Reduce terminal output")
     return parser.parse_args()
+
+
+def resolve_output_base(input_file: str, output: str) -> str:
+    if output:
+        return os.path.splitext(output)[0]
+    if os.path.exists(input_file):
+        return os.path.splitext(input_file)[0]
+    # Remote URL: derive a name from the path component.
+    name = os.path.splitext(urlparse(input_file).path)[0].split("/")[-1] or "transcription"
+    return name
 
 
 def main():
     args = parse_args()
     input_file = args.input_file
-    context = args.context
-    dashscope_api_key = args.dashscope_api_key
-    num_threads = args.num_threads
-    vad_segment_threshold = args.vad_segment_threshold
-    tmp_dir = args.tmp_dir
-    save_srt = args.save_srt
     silence = args.silence
 
-    # check if input file exists
+    def info(msg):
+        if not silence:
+            print(msg)
+
+    # Validate input.
     if input_file.startswith(("http://", "https://")):
         try:
             response = requests.head(input_file, allow_redirects=True, timeout=5)
@@ -49,103 +62,59 @@ def main():
         except Exception as e:
             raise FileNotFoundError(f"HTTP link {input_file} does not exist or is inaccessible: {str(e)}")
     elif not os.path.exists(input_file):
-        raise FileNotFoundError(f"Input file \"{input_file}\" does not exist!")
+        raise FileNotFoundError(f'Input file "{input_file}" does not exist!')
 
-    if dashscope_api_key:
-        dashscope.api_key = dashscope_api_key
-    else:
-        assert "DASHSCOPE_API_KEY" in os.environ, f"Please set DASHSCOPE_API_KEY as an environment variable, or specify it with '-key' argument"
+    # Load and resample audio (handles video via ffmpeg fallback).
+    info("Loading audio...")
+    wav = load_audio(input_file, verbose=not silence)
+    info(f"Loaded audio duration: {len(wav) / WAV_SAMPLE_RATE:.2f}s")
 
-    qwen3asr = QwenASR(model="qwen3-asr-flash")
+    # Load the model (forced aligner only when SRT is requested).
+    info(f"Loading model '{args.model}' on {args.device} ({args.dtype})...")
+    qwen3asr = QwenASR(
+        model_path=args.model,
+        device=args.device,
+        dtype=args.dtype,
+        aligner_path=args.aligner if args.save_srt else None,
+        max_inference_batch_size=args.max_batch_size,
+        max_new_tokens=args.max_new_tokens,
+        attn_implementation=args.attn,
+    )
 
-    wav = load_audio(input_file)
-    if not silence:
-        print(f"Loaded wav duration: {len(wav) / WAV_SAMPLE_RATE:.2f}s")
+    info("Transcribing...")
+    result = qwen3asr.transcribe(
+        audio=(wav, WAV_SAMPLE_RATE),
+        context=args.context,
+        language=args.language,
+        return_time_stamps=args.save_srt,
+        chunk_sec=args.chunk_sec,
+        verbose=not silence,
+    )
 
-    # Segment wav exceeding 3 minutes
-    if len(wav) / WAV_SAMPLE_RATE >= 180:
-        if not silence:
-            print(f"Wav duration is longer than 3 min, initializing Silero VAD model for segmenting...")
-        worker_vad_model = load_silero_vad(onnx=True)
-        wav_list = process_vad(wav, worker_vad_model, segment_threshold_s=vad_segment_threshold)
-        if not silence:
-            print(f"Segmenting done, total segments: {len(wav_list)}")
-    else:
-        wav_list = [(0, len(wav), wav)]
+    language = result.language or "Unknown"
+    full_text = result.text
 
-    # Save processed audio to tmp dir
-    wav_name = os.path.basename(input_file)
-    wav_dir_name = os.path.splitext(wav_name)[0]
-    save_dir = os.path.join(tmp_dir, wav_dir_name)
+    info(f"Detected Language: {language}")
+    info(f"Full Transcription: {full_text}")
 
-    wav_path_list = []
-    for idx, (_, _, wav_data) in enumerate(wav_list):
-        wav_path = os.path.join(save_dir, f"{wav_name}_{idx}.wav")
-        save_audio_file(wav_data, wav_path)
-        wav_path_list.append(wav_path)
+    out_base = resolve_output_base(input_file, args.output)
 
-    # Multithread call qwen3-asr-flash api
-    results = []
-    languages = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-        future_dict = {
-            executor.submit(qwen3asr.asr, wav_path, context): idx
-            for idx, wav_path in enumerate(wav_path_list)
-        }
-        if not silence:
-            pbar = tqdm(total=len(future_dict), desc="Calling Qwen3-ASR-Flash API")
-        for future in concurrent.futures.as_completed(future_dict):
-            idx = future_dict[future]
-            language, recog_text = future.result()
-            results.append((idx, recog_text))
-            languages.append(language)
-            if not silence:
-                pbar.update(1)
-        if not silence:
-            pbar.close()
+    # Save transcription text (UTF-8 for multilingual safety on Windows).
+    txt_path = out_base + ".txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(language + "\n")
+        f.write(full_text + "\n")
+    print(f'Transcription of "{input_file}" saved to "{txt_path}"')
 
-    # Sort and splice in the original order
-    results.sort(key=lambda x: x[0])
-    full_text = " ".join(text for _, text in results)
-    language = Counter(languages).most_common(1)[0][0]
-
-    if not silence:
-        print(f"Detected Language: {language}")
-        print(f"Full Transcription: {full_text}")
-
-    # Delete tmp save dir
-    os.system(f"rm -rf {save_dir}")
-
-    # Save full text to local file
-    if os.path.exists(input_file):
-        save_file = os.path.splitext(input_file)[0] + ".txt"
-    else:
-        save_file = os.path.splitext(urlparse(input_file).path)[0].split('/')[-1] + '.txt'
-
-    with open(save_file, 'w') as f:
-        f.write(language + '\n')
-        f.write(full_text + '\n')
-
-    print(f"Full transcription of \"{input_file}\" from Qwen3-ASR-Flash API saved to \"{save_file}\"!")
-
-    # Save subtitles to local SRT file
+    # Save SRT subtitles.
     if args.save_srt:
-        subtitles = []
-        for idx, result in enumerate(results):
-            start_time = wav_list[idx][0] / WAV_SAMPLE_RATE
-            end_time = wav_list[idx][1] / WAV_SAMPLE_RATE
-            content = result[1]
-            subtitles.append(srt.Subtitle(
-                index=idx,
-                start=timedelta(seconds=start_time),
-                end=timedelta(seconds=end_time),
-                content=content
-            ))
-        final_srt_content = srt.compose(subtitles)
-        with open(os.path.splitext(save_file)[0] + ".srt", 'w') as f:
-            f.write(final_srt_content)
-    print(f"SRT subtitles of \"{input_file}\" from Qwen3-ASR-Flash API saved to \"{save_dir}\"!")
+        items = list(result.time_stamps) if result.time_stamps is not None else []
+        srt_content = build_srt(items)
+        srt_path = out_base + ".srt"
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+        print(f'SRT subtitles of "{input_file}" saved to "{srt_path}"')
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

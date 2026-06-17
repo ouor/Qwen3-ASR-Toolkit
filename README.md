@@ -1,7 +1,7 @@
 # Qwen3-ASR-Toolkit
 
 [![PyPI version](https://badge.fury.io/py/qwen3-asr-toolkit.svg)](https://badge.fury.io/py/qwen3-asr-toolkit)
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Also in](https://img.shields.io/badge/Also%20in-Java-orange.svg)](#-implementations-in-other-languages)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -11,29 +11,29 @@ Qwen3-ASR is now **open-sourced** 🎉🎉🎉. Welcome to visit the [**GitHub**
 
 ## Overview 
 
-An advanced, high-performance Python command-line toolkit for using the **Qwen-ASR API** (formerly Qwen3-ASR-Flash). This implementation overcomes the API's 3-minute audio length limitation by intelligently splitting long audio/video files and processing them in parallel, enabling rapid transcription of hours-long content.
+A high-performance Python command-line toolkit that runs the **open-source Qwen3-ASR models fully offline on your local GPU**. It wraps the official [`qwen-asr`](https://github.com/QwenLM/Qwen3-ASR) inference library with a simple CLI that transcribes long audio/video files of any length to `.txt`, and optionally generates timestamped `.srt` subtitles via the Qwen3-ForcedAligner. No API key, no cloud — your audio never leaves your machine.
+
+> **Note:** This is a local-GPU fork. The upstream project drives the cloud **Qwen-ASR API** instead; if you want the API version, see the [original repository](https://github.com/QwenLM/Qwen3-ASR-Toolkit).
 
 ## 🚀 Key Features
 
--   **Break the 3-Minute Limit**: Seamlessly transcribe audio and video files of any length by bypassing the official API's duration constraint.
--   **Smart Audio Splitting**: Utilizes **Voice Activity Detection (VAD)** to split audio into meaningful chunks at natural silent pauses. This ensures that words and sentences are not awkwardly cut off.
--   **High-Speed Parallel Processing**: Leverages multi-threading to send audio chunks to the Qwen-ASR API concurrently, dramatically reducing the total transcription time for long files.
--   **Intelligent Post-Processing**: Automatically detects and removes common ASR **hallucinations and repetitive artifacts** for cleaner, more accurate transcripts.
--   **SRT Subtitle Generation**: Automatically create timestamped **`.srt` subtitle files** based on VAD segments, perfect for adding captions to video content.
--   **Automatic Audio Resampling**: Automatically converts audio from any sample rate and channel count to the 16kHz mono format required by the Qwen-ASR API. You can use any audio file without worrying about pre-processing.
--   **Universal Media Support**: Supports virtually any audio and video format (e.g., `.mp4`, `.mov`, `.mkv`, `.mp3`, `.wav`, `.m4a`) thanks to its reliance on FFmpeg.
--   **Simple & Easy to Use**: A straightforward command-line interface allows you to get started with just a single command.
+-   **Fully Offline**: Runs the Qwen3-ASR models locally on your own NVIDIA GPU. No API key and no network calls during transcription.
+-   **Any Length**: The underlying library automatically chunks long audio internally (up to ~20 min per ASR window), so hours-long files just work.
+-   **52 Languages**: Automatic language identification and recognition across 52 languages and dialects, including Korean, English, Chinese, Japanese, and more.
+-   **Intelligent Post-Processing**: Common ASR **hallucinations and repetitive artifacts** are detected and removed automatically by the library for cleaner transcripts.
+-   **SRT Subtitle Generation**: Optionally produce timestamped **`.srt` subtitle files** using the Qwen3-ForcedAligner model for word-level alignment.
+-   **Automatic Audio Resampling**: Converts audio from any sample rate and channel count to the 16kHz mono format the model expects — no pre-processing needed.
+-   **Universal Media Support**: Handles virtually any audio and video format (e.g., `.mp4`, `.mov`, `.mkv`, `.mp3`, `.wav`, `.m4a`) thanks to its FFmpeg fallback.
+-   **Simple & Easy to Use**: A straightforward command-line interface gets you transcribing with a single command.
 
 ## ⚙️ How It Works
 
-This tool follows a robust pipeline to deliver fast and accurate transcriptions for long-form media:
+This tool follows a simple, fully-local pipeline:
 
-1.  **Media Loading**: The script first loads your media file, whether it's a **local file or a remote URL**.
-2.  **VAD-based Chunking**: It analyzes the audio stream using Voice Activity Detection (VAD) to identify silent segments.
-3.  **Intelligent Splitting**: The audio is then split into smaller chunks based on the detected silences. Each chunk's duration is managed to stay under the 3-minute API limit, with a **user-configurable target length (defaulting to 120 seconds)**, preventing mid-sentence cuts.
-4.  **Parallel API Calls**: A thread pool is initiated to upload and process these chunks concurrently using the DashScope Qwen-ASR API.
-5.  **Result Aggregation & Cleaning**: The transcribed text segments from all chunks are collected, re-ordered, and then **post-processed to remove detected repetitions and hallucinations**.
-6.  **Output Generation**: The final, cleaned transcription is printed to the console and saved to a `.txt` file. **Optionally, a timestamped `.srt` subtitle file can also be generated.**
+1.  **Media Loading**: Loads your media file (**local file or remote URL**), using librosa with an FFmpeg fallback for video and exotic codecs, and resamples to 16kHz mono.
+2.  **Model Loading**: Loads the Qwen3-ASR model onto your GPU once (and the Qwen3-ForcedAligner too, when `--save-srt` is requested).
+3.  **Transcription**: Hands the waveform to `qwen_asr.Qwen3ASRModel.transcribe()`, which internally chunks long audio, runs batched inference, identifies the language, and cleans up repetitions.
+4.  **Output Generation**: The transcription is printed to the console and saved to a UTF-8 `.txt` file. **Optionally, a timestamped `.srt` subtitle file is also generated** from forced-alignment word timestamps.
 
 ## 🏁 Getting Started
 
@@ -41,58 +41,50 @@ Follow these steps to set up and run the project on your local machine.
 
 ### Prerequisites
 
--   Python 3.8 or higher.
--   **FFmpeg**: The script requires FFmpeg to be installed on your system to handle media files.
+-   **An NVIDIA GPU with CUDA.** A 1.7B model needs roughly 5–6 GB of VRAM in bfloat16; an RTX 3090 (24 GB) runs it comfortably. CPU-only inference works but is very slow.
+-   **Python 3.10+** (3.12 recommended). A clean conda environment avoids dependency conflicts.
+-   **FFmpeg** on your PATH, for video and non-standard audio formats.
     -   **Ubuntu/Debian**: `sudo apt update && sudo apt install ffmpeg`
     -   **macOS**: `brew install ffmpeg`
     -   **Windows**: Download from the [official FFmpeg website](https://ffmpeg.org/download.html) and add it to your system's PATH.
--   **DashScope API Key**: You need an API key from Alibaba Cloud's DashScope.
-    -   You can obtain one from the [DashScope Console](https://dashscope.console.aliyun.com/apiKey). If you are calling the API services of Tongyi Qwen for the first time, you can follow the tutorial on [this website](https://help.aliyun.com/zh/model-studio/first-api-call-to-qwen) to create your own API Key.
-    -   For better security and convenience, it is **highly recommended** to set your API key as an environment variable named `DASHSCOPE_API_KEY`. The script will automatically use it, and you won't need to pass the `--api-key` argument in the command.
-
-        **On Linux/macOS:**
-        ```bash
-        export DASHSCOPE_API_KEY="your_api_key_here"
-        ```
-        *(To make this permanent, add the line to your `~/.bashrc`, `~/.zshrc`, or `~/.profile` file.)*
-
-        **On Windows (Command Prompt):**
-        ```cmd
-        set DASHSCOPE_API_KEY="your_api_key_here"
-        ```
-
-        **On Windows (PowerShell):**
-        ```powershell
-        $env:DASHSCOPE_API_KEY="your_api_key_here"
-        ```
-        *(For a permanent setting on Windows, search for "Edit the system environment variables" in the Start Menu and add `DASHSCOPE_API_KEY` to your user variables.)*
 
 ### Installation
 
-We recommend installing the tool directly from PyPI for the simplest setup.
-
-#### Option 1: Install from PyPI (Recommended)
-
-Simply run the following command in your terminal. This will install the package and make the `qwen3-asr` command available system-wide.
+#### 1. Create an environment and install CUDA PyTorch
 
 ```bash
-pip install qwen3-asr-toolkit
+conda create -n qwen3-asr python=3.12 -y
+conda activate qwen3-asr
+
+# Install a CUDA build of torch matching your driver (cu128 shown here).
+# Keep torch / torchaudio / torchvision on the SAME CUDA build.
+pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
-#### Option 2: Install from Source
+#### 2. Install the toolkit
 
-If you want to install the latest development version or contribute to the project, you can install from the source code.
+```bash
+git clone https://github.com/QwenLM/Qwen3-ASR-Toolkit.git
+cd Qwen3-ASR-Toolkit
+pip install .
+```
 
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/QwenLM/Qwen3-ASR-Toolkit.git
-    cd Qwen3-ASR-Toolkit
-    ```
+This pulls in the official [`qwen-asr`](https://github.com/QwenLM/Qwen3-ASR) inference library and makes the `qwen3-asr` command available.
 
-2.  Install the package:
-    ```bash
-    pip install .
-    ```
+#### 3. (Optional) Pre-download the models
+
+The model weights download automatically on first run. To fetch them ahead of time (or on a machine that can't download during execution):
+
+```bash
+hf download Qwen/Qwen3-ASR-1.7B
+hf download Qwen/Qwen3-ForcedAligner-0.6B   # only needed for --save-srt
+```
+
+> **Windows tip:** if Hugging Face downloads stall, disable the Xet transfer backend and use plain HTTPS:
+> ```powershell
+> $env:HF_HUB_DISABLE_XET=1
+> hf download Qwen/Qwen3-ASR-1.7B
+> ```
 
 ## 📖 Usage
 
@@ -101,27 +93,33 @@ Once installed, you can use the `qwen3-asr` command directly from your terminal.
 ### Command
 
 ```bash
-qwen3-asr -i <input_file_or_url> [-key <api_key>] [-j <num_threads>] [-c <context>] [-d <duration>] [-t <tmp_dir>] [--save-srt] [-s]
+qwen3-asr -i <input_file_or_url> [-c <context>] [-l <language>] [-m <model>] [--device <dev>] [--dtype <dtype>] [--save-srt] [-o <output>] [-s]
 ```
 
 ### Arguments
 
-| Argument                  | Short  | Description                                                                          | Required/Optional                        |
-| ------------------------- | ------ | ------------------------------------------------------------------------------------ | ---------------------------------------- |
-| `--input-file`            | `-i`   | Path to the local media file or a remote URL (http/https) to transcribe.             | **Required**                             |
-| `--context`               | `-c`   | Text context to guide the ASR model, improving recognition of specific terms.        | Optional, Default: `""`                  |
-| `--dashscope-api-key`     | `-key` | Your DashScope API Key.                                                              | Optional (if `DASHSCOPE_API_KEY` is set) |
-| `--num-threads`           | `-j`   | The number of concurrent threads to use for API calls.                               | Optional, **Default: 4**                 |
-| `--vad-segment-threshold` | `-d`   | Target duration in seconds for each VAD-split audio chunk.                           | Optional, **Default: 120**               |
-| `--tmp-dir`               | `-t`   | Path to a directory for storing temporary chunk files.                               | Optional, Default: `~/qwen3-asr-cache`   |
-| `--save-srt`              | `-srt` | Generate and save a timestamped SRT subtitle file in addition to the `.txt` file.    | Optional                                 |
-| `--silence`               | `-s`   | Silence mode. Suppresses detailed progress and chunking information on the terminal. | Optional                                 |
+| Argument            | Short  | Description                                                                                  | Required/Optional                               |
+| ------------------- | ------ | -------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `--input-file`      | `-i`   | Path to the local media file or a remote URL (http/https) to transcribe.                     | **Required**                                    |
+| `--context`         | `-c`   | Text context to bias the model toward specific terms/jargon.                                  | Optional, Default: `""`                         |
+| `--language`        | `-l`   | Force a language (e.g. `Korean`, `English`). Omit to auto-detect.                             | Optional, Default: auto-detect                  |
+| `--model`           | `-m`   | ASR model repo id or local path.                                                             | Optional, Default: `Qwen/Qwen3-ASR-1.7B`        |
+| `--device`          |        | Torch device, e.g. `cuda:0` or `cpu`.                                                         | Optional, Default: `cuda:0`                      |
+| `--dtype`           |        | Inference dtype: `bfloat16`, `float16`, or `float32`.                                         | Optional, Default: `bfloat16`                    |
+| `--max-batch-size`  |        | Max internal inference batch size. Raise only for many short files; keep at 1 for long audio.| Optional, Default: `1`                          |
+| `--chunk-sec`       |        | Internal ASR chunk length (seconds). Auto-sized to free VRAM by default — no OOM, no truncation. | Optional, Default: auto                       |
+| `--max-new-tokens`  |        | Max tokens generated per audio chunk.                                                        | Optional, Default: `4096`                       |
+| `--attn`            |        | `attn_implementation`, e.g. `flash_attention_2` or `sdpa`.                                    | Optional                                        |
+| `--save-srt`        | `-srt` | Also generate a timestamped `.srt` subtitle file (loads the forced aligner).                 | Optional                                        |
+| `--aligner`         |        | Forced-aligner model (only used with `--save-srt`).                                           | Optional, Default: `Qwen/Qwen3-ForcedAligner-0.6B` |
+| `--output`          | `-o`   | Output path base (without extension). Default: alongside the input file.                      | Optional                                        |
+| `--silence`         | `-s`   | Silence mode. Suppresses progress messages on the terminal.                                  | Optional                                        |
 
 ### Output
 
-The full transcription result will be printed to the terminal (unless in `--silence` mode) and also saved in a `.txt` file in the same directory as the input file. For example, if you process `my_video.mp4`, the output will be saved to `my_video.txt`.
+The transcription is printed to the terminal (unless in `--silence` mode) and saved as a UTF-8 `.txt` file next to the input (e.g. `my_video.mp4` → `my_video.txt`). The first line is the detected language, the second is the transcript.
 
-**If you use the `--save-srt` flag, a corresponding `my_video.srt` subtitle file will also be created in the same directory.**
+**If you use the `--save-srt` flag, a corresponding `my_video.srt` subtitle file is also created.**
 
 ---
 
@@ -131,7 +129,7 @@ Here are a few examples of how to use the tool.
 
 #### 1. Basic Transcription of a Local File
 
-Transcribe a video file using the default 4 threads. This command assumes you have set the `DASHSCOPE_API_KEY` environment variable.
+Transcribe a video file with auto language detection on the default GPU. The model downloads automatically on first run.
 
 ```bash
 qwen3-asr -i "/path/to/my/long_lecture.mp4"
@@ -147,33 +145,40 @@ qwen3-asr -i "https://somewebsite.com/audios/podcast_episode.mp3"
 
 #### 3. Generate an SRT Subtitle File
 
-Use the `--save-srt` (or `-srt`) flag to generate a timestamped subtitle file alongside the plain text transcript. This is ideal for video captioning.
+Use the `--save-srt` (or `-srt`) flag to also generate a timestamped subtitle file via the forced aligner. This is ideal for video captioning.
 
 ```bash
 qwen3-asr -i "/path/to/my/documentary.mp4" -srt
 ```
 *This command will create `documentary.txt` and `documentary.srt`.*
 
-#### 4. Increase Concurrency and Pass API Key
+#### 4. Force a Language
 
-Transcribe a long audio file using 8 parallel threads and pass the API key directly via the command line.
-
-```bash
-qwen3-asr -i "/path/to/my/podcast_episode_01.wav" -j 8 -key "your_api_key_here"
-```
-
-#### 5. Provide Context and Customize Chunk Duration
-
-If your audio contains specific jargon, use the `-c` flag. If you prefer shorter, more frequent subtitle segments, use `-d` to set a smaller chunk duration.
+Skip language detection when you already know the language (e.g. `Korean`).
 
 ```bash
-qwen3-asr -i "/path/to/my/tech_talk.mp4" -c "Qwen-ASR, DashScope, FFmpeg" -d 60 -srt
+qwen3-asr -i "/path/to/my/interview.wav" -l Korean
 ```
-*This command will try to split the audio into chunks around 60 seconds long, which can result in more granular subtitles.*
 
-#### 6. Run in Silence Mode
+#### 5. Provide Context and Pick a Model
 
-Use the `-s` or `--silence` flag to prevent progress details from being printed to the terminal. The final transcript will still be saved to a file.
+Bias recognition toward domain jargon with `-c`, and choose a model with `-m` (e.g. the lighter `0.6B`).
+
+```bash
+qwen3-asr -i "/path/to/my/tech_talk.mp4" -c "Qwen3-ASR, FFmpeg, bfloat16" -m Qwen/Qwen3-ASR-0.6B -srt
+```
+
+#### 6. Manage GPU Memory
+
+Long audio works out of the box — the ASR chunk length is **auto-sized to fit your free VRAM** (no OOM, no offload, no truncation). On a smaller GPU you can force a shorter chunk, or pick a specific device/dtype:
+
+```bash
+qwen3-asr -i "/path/to/my/podcast.wav" --device cuda:0 --dtype float16 --chunk-sec 180
+```
+
+#### 7. Run in Silence Mode
+
+Use `-s` / `--silence` to suppress progress messages. The transcript is still saved to a file.
 
 ```bash
 qwen3-asr -i "/path/to/my/meeting_recording.m4a" -s

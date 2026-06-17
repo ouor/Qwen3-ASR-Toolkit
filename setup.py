@@ -6,13 +6,13 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
-        'dashscope',
+        # NOTE: install a CUDA build of torch separately, e.g.
+        #   pip install torch --index-url https://download.pytorch.org/whl/cu128
+        'qwen-asr',
         'librosa',
         'soundfile',
-        'silero_vad',
-        'pydub',
-        'tqdm',
         'numpy',
+        'requests',
         'srt'
     ],
     entry_points={

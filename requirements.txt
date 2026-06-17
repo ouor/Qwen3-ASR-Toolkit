@@ -1,11 +1,8 @@
-dashscope
+# Install a CUDA build of torch first, matching your GPU/driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+qwen-asr
 librosa
-pydub
-silero_vad
 soundfile
-tqdm
-setuptools
-wheel
+numpy
 requests
-urllib
 srt

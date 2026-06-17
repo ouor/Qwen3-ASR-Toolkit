@@ -1,26 +1,32 @@
-import os
 import io
-import librosa
+import sys
+import srt
 import subprocess
 import numpy as np
 import soundfile as sf
 
-from silero_vad import get_speech_timestamps
+from datetime import timedelta
 
 
 WAV_SAMPLE_RATE = 16000
 
 
-def load_audio(file_path: str) -> np.ndarray:
+def load_audio(file_path: str, verbose: bool = True) -> np.ndarray:
+    """Load any local/remote media into a 16 kHz mono float32 waveform.
+
+    Tries librosa first (fast for common audio formats); falls back to FFmpeg,
+    which also handles video containers (mp4/mkv/mov, ...) and exotic codecs.
+    """
     try:
         if file_path.startswith(("http://", "https://")):
-            raise ValueError("Using ffmpeg to load remote file.")
-        # Try librosa first, because it is usually faster for standard formats.
+            # Force the FFmpeg path for remote files (robust for any container).
+            raise ValueError("remote file -> ffmpeg")
+        import librosa
         wav_data, _ = librosa.load(file_path, sr=WAV_SAMPLE_RATE, mono=True)
         return wav_data
     except Exception as e:
-        print(e)
-        # After librosa fails, use a more powerful ffmpeg as a backup.
+        if verbose and not str(e).endswith("ffmpeg"):
+            print(f"librosa load failed, falling back to ffmpeg: {e}", file=sys.stderr)
         try:
             command = [
                 'ffmpeg',
@@ -31,99 +37,75 @@ def load_audio(file_path: str) -> np.ndarray:
                 '-f', 'wav',
                 '-'
             ]
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout_data, stderr_data = process.communicate()
 
             if process.returncode != 0:
-                raise RuntimeError(f"FFmpeg error processing local file: {stderr_data.decode('utf-8', errors='ignore')}")
+                raise RuntimeError(f"FFmpeg error: {stderr_data.decode('utf-8', errors='ignore')}")
 
             with io.BytesIO(stdout_data) as data_io:
-                wav_data, sr = sf.read(data_io, dtype='float32')
-
+                wav_data, _ = sf.read(data_io, dtype='float32')
             return wav_data
         except Exception as ffmpeg_e:
-            raise RuntimeError(f"Failed to load audio from local file '{file_path}' even with ffmpeg. Error: {ffmpeg_e}")
+            raise RuntimeError(f"Failed to load audio from '{file_path}' even with ffmpeg. Error: {ffmpeg_e}")
 
 
-def process_vad(wav: np.ndarray, worker_vad_model, segment_threshold_s: int = 120, max_segment_threshold_s: int = 180) -> list[np.ndarray]:
-    try:
-        vad_params = {
-            'sampling_rate': WAV_SAMPLE_RATE,
-            'return_seconds': False,
-            'min_speech_duration_ms': 1500,
-            'min_silence_duration_ms': 500
-        }
+def build_srt(items, max_cue_sec: float = 6.0, gap_sec: float = 0.8, max_chars: int = 42) -> str:
+    """Group word-level forced-alignment items into readable SRT cues.
 
-        speech_timestamps = get_speech_timestamps(
-            wav,
-            worker_vad_model,
-            **vad_params
-        )
+    A new cue starts when the current one would exceed ``max_cue_sec`` in duration
+    or ``max_chars`` in length, or when the silent gap before the next word exceeds
+    ``gap_sec``. Word items carry no punctuation, so cues are joined with spaces for
+    space-delimited languages and concatenated for CJK.
 
-        if not speech_timestamps:
-            raise ValueError("No speech segments detected by VAD.")
+    Args:
+        items: Iterable of objects with ``.text``, ``.start_time``, ``.end_time`` (seconds).
+        max_cue_sec: Maximum duration of a single subtitle cue.
+        gap_sec: Silence (seconds) between words that forces a cue break.
+        max_chars: Soft maximum characters per cue.
 
-        potential_split_points_s = {0.0, len(wav)}
-        for i in range(len(speech_timestamps)):
-            start_of_next_s = speech_timestamps[i]['start']
-            potential_split_points_s.add(start_of_next_s)
-        sorted_potential_splits = sorted(list(potential_split_points_s))
+    Returns:
+        SRT-formatted string.
+    """
+    items = [it for it in items if str(getattr(it, "text", "")).strip() != ""]
+    if not items:
+        return ""
 
-        final_split_points_s = {0.0, len(wav)}
-        segment_threshold_samples = segment_threshold_s * WAV_SAMPLE_RATE
-        target_time = segment_threshold_samples
-        while target_time < len(wav):
-            closest_point = min(sorted_potential_splits, key=lambda p: abs(p - target_time))
-            final_split_points_s.add(closest_point)
-            target_time += segment_threshold_samples
-        final_ordered_splits = sorted(list(final_split_points_s))
+    def join_words(words):
+        # Use spaces unless the run is dominated by CJK single-char tokens.
+        cjk = sum(1 for w in words if len(w) == 1 and ord(w[0]) >= 0x3000)
+        sep = "" if cjk > len(words) / 2 else " "
+        return sep.join(words)
 
-        max_segment_threshold_samples = max_segment_threshold_s * WAV_SAMPLE_RATE
-        new_split_points = [0.0]
+    cues = []  # list of (start, end, [words])
+    cur_words = [items[0].text]
+    cur_start = items[0].start_time
+    cur_end = items[0].end_time
 
-        # Make sure that each audio segment does not exceed max_segment_threshold_s
-        for i in range(1, len(final_ordered_splits)):
-            start = final_ordered_splits[i - 1]
-            end = final_ordered_splits[i]
-            segment_length = end - start
+    for prev, it in zip(items, items[1:]):
+        gap = it.start_time - prev.end_time
+        cur_text_len = len(join_words(cur_words))
+        too_long = (it.end_time - cur_start) > max_cue_sec
+        too_wide = cur_text_len + 1 + len(it.text) > max_chars
+        if gap > gap_sec or too_long or too_wide:
+            cues.append((cur_start, cur_end, cur_words))
+            cur_words = [it.text]
+            cur_start = it.start_time
+            cur_end = it.end_time
+        else:
+            cur_words.append(it.text)
+            cur_end = it.end_time
+    cues.append((cur_start, cur_end, cur_words))
 
-            if segment_length <= max_segment_threshold_samples:
-                new_split_points.append(end)
-            else:
-                num_subsegments = int(np.ceil(segment_length / max_segment_threshold_samples))
-                subsegment_length = segment_length / num_subsegments
-
-                for j in range(1, num_subsegments):
-                    split_point = start + j * subsegment_length
-                    new_split_points.append(split_point)
-
-                new_split_points.append(end)
-
-        segmented_wavs = []
-        for i in range(len(new_split_points) - 1):
-            start_sample = int(new_split_points[i])
-            end_sample = int(new_split_points[i + 1])
-            segmented_wavs.append((start_sample, end_sample, wav[start_sample:end_sample]))
-        return segmented_wavs
-
-    except Exception as e:
-        segmented_wavs = []
-        total_samples = len(wav)
-        max_chunk_size_samples = max_segment_threshold_s * WAV_SAMPLE_RATE
-
-        for start_sample in range(0, total_samples, max_chunk_size_samples):
-            end_sample = min(start_sample + max_chunk_size_samples, total_samples)
-            segment = wav[start_sample:end_sample]
-            if len(segment) > 0:
-                segmented_wavs.append((start_sample, end_sample, segment))
-
-        return segmented_wavs
-
-
-def save_audio_file(wav: np.ndarray, file_path: str):
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    sf.write(file_path, wav, WAV_SAMPLE_RATE)
+    subtitles = []
+    for idx, (start, end, words) in enumerate(cues, start=1):
+        # Guard against zero/negative durations from alignment noise.
+        if end <= start:
+            end = start + 0.1
+        subtitles.append(srt.Subtitle(
+            index=idx,
+            start=timedelta(seconds=float(start)),
+            end=timedelta(seconds=float(end)),
+            content=join_words(words),
+        ))
+    return srt.compose(subtitles)
